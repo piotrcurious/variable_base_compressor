@@ -1,49 +1,61 @@
 import os
 import math
-import numpy as np
+import heapq
 import bitarray
-import random
+import numpy as np
 
 # Constants
-MAX_BASE_SIZE = 256
 PROGMEM = "__attribute__((section(\".progmem.data\")))"
 
-def create_freq_table(data):
-    if not data:
-        return [], {}, 1
+def build_huffman_tree(counts):
+    # Use a priority queue to build the tree
+    # (frequency, unique_id, [symbol, left, right])
+    # Added unique_id to prevent comparison errors between nodes with same frequency
+    heap = [[freq, i, [sym, None, None]] for i, (sym, freq) in enumerate(counts.items())]
+    heapq.heapify(heap)
 
-    counts = {}
-    for x in data:
-        counts[x] = counts.get(x, 0) + 1
+    if len(heap) == 1:
+        sym, freq = next(iter(counts.items()))
+        return {sym: 1}
 
-    sorted_vals = sorted(counts.keys(), key=lambda x: counts[x], reverse=True)
-    return sorted_vals, counts, 1
+    next_id = len(heap)
+    while len(heap) > 1:
+        freq1, id1, node1 = heapq.heappop(heap)
+        freq2, id2, node2 = heapq.heappop(heap)
+        combined_node = [None, node1, node2]
+        heapq.heappush(heap, [freq1 + freq2, next_id, combined_node])
+        next_id += 1
 
-def get_bits_needed(n):
-    if n <= 1:
-        return 0
-    return (n - 1).bit_length()
+    code_lengths = {}
+    def traverse(node, length):
+        sym, left, right = node
+        if sym is not None:
+            code_lengths[sym] = length
+        else:
+            traverse(left, length + 1)
+            traverse(right, length + 1)
 
-def encode_data(data, val_to_idx, common_denom, base_size):
-    encoded_bits = bitarray.bitarray()
-    bits_for_mod = get_bits_needed(base_size)
+    _, _, root = heap[0]
+    traverse(root, 0)
+    return code_lengths
 
-    for x in data:
-        val = x // common_denom
-        idx = val_to_idx[val]
-        q = idx // base_size
-        r = idx % base_size
+def build_canonical_codes(code_lengths):
+    sorted_symbols = sorted(code_lengths.keys(), key=lambda x: (code_lengths[x], x))
 
-        # Unary for q
-        encoded_bits.extend('1' * q)
-        encoded_bits.append(False)
+    canonical_codes = {}
+    current_code = 0
+    current_length = 0
 
-        # Binary for r
-        if bits_for_mod > 0:
-            for b_idx in range(bits_for_mod - 1, -1, -1):
-                encoded_bits.append((r >> b_idx) & 1)
+    for sym in sorted_symbols:
+        length = code_lengths[sym]
+        if length > current_length:
+            current_code <<= (length - current_length)
+            current_length = length
 
-    return encoded_bits
+        canonical_codes[sym] = (current_code, length)
+        current_code += 1
+
+    return canonical_codes
 
 def compress_dir(dir_name):
     if not os.path.exists(dir_name):
@@ -64,35 +76,20 @@ def compress_dir(dir_name):
     if not data_list: return 0, []
 
     all_data = [x for data in data_list for x in data]
-    sorted_vals, counts, common_denom = create_freq_table(all_data)
-    val_to_idx = {val: i for i, val in enumerate(sorted_vals)}
+    counts = {}
+    for x in all_data:
+        counts[x] = counts.get(x, 0) + 1
     
-    total_original_size = len(all_data)
-    best_ratio = -1
-    best_base_size = 1
+    code_lengths = build_huffman_tree(counts)
+    canonical_codes = build_canonical_codes(code_lengths)
     
-    for b in range(1, min(len(sorted_vals) + 1, MAX_BASE_SIZE)):
-        bits_for_mod = get_bits_needed(b)
-        total_bits = 0
-        for val, count in counts.items():
-            idx = val_to_idx[val]
-            q = idx // b
-            total_bits += count * (q + 1 + bits_for_mod)
+    max_len = max(code_lengths.values())
+    len_counts = [0] * (max_len + 1)
+    for l in code_lengths.values():
+        len_counts[l] += 1
 
-        compressed_data_size = (total_bits + 7) // 8
-        overhead = 4 * 2 + len(sorted_vals) * 2 + len(data_list) * 12
-        total_comp = compressed_data_size + overhead
-        ratio = total_original_size / total_comp if total_comp > 0 else 0
-
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_base_size = b
-
-    print(f"Best base size: {best_base_size}, Optimal Ratio: {best_ratio:.2f}")
-    
-    bits_for_mod = get_bits_needed(best_base_size)
-    # Using int16_t for compatibility
-    common_data = [common_denom, best_base_size, len(sorted_vals), bits_for_mod] + sorted_vals
+    sorted_symbols = sorted(code_lengths.keys(), key=lambda x: (code_lengths[x], x))
+    common_data = [len(sorted_symbols), max_len] + len_counts[1:] + sorted_symbols
     
     with open("common.h", "w") as f:
         f.write("#ifndef COMMON_H\n#define COMMON_H\n#include <stdint.h>\n\n")
@@ -104,7 +101,12 @@ def compress_dir(dir_name):
         f.write("\n};\n\n#endif\n")
 
     for i, data in enumerate(data_list):
-        encoded = encode_data(data, val_to_idx, common_denom, best_base_size)
+        encoded_bits = bitarray.bitarray()
+        for x in data:
+            code, length = canonical_codes[x]
+            code_bits = bin(code)[2:].zfill(length)
+            encoded_bits.extend(code_bits)
+
         header_name = file_names[i].replace(".", "_") + "_h"
         filename = file_names[i] + ".h"
 
@@ -112,17 +114,17 @@ def compress_dir(dir_name):
             guard = filename.upper().replace(".", "_")
             f.write(f"#ifndef {guard}\n#define {guard}\n#include <stdint.h>\n\n")
             f.write(f"const uint8_t {header_name}[] {PROGMEM} = {{\n")
-            bytes_data = encoded.tobytes()
+            bytes_data = encoded_bits.tobytes()
             for j, x in enumerate(bytes_data):
                 f.write(f"0x{x:02x}")
                 if j < len(bytes_data) - 1: f.write(", ")
                 if (j + 1) % 12 == 0: f.write("\n")
             f.write("\n};\n\n")
             f.write(f"const unsigned int {header_name}_len = {len(data)};\n")
-            f.write(f"const unsigned long {header_name}_bits = {len(encoded)};\n")
+            f.write(f"const unsigned long {header_name}_bits = {len(encoded_bits)};\n")
             f.write("#endif\n")
 
-    return best_ratio, []
+    return 1.0, []
 
 if __name__ == "__main__":
     import sys
