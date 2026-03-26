@@ -3,11 +3,11 @@
 #include "file_data.h"
 #include <vector>
 
-// Common parameters
-int common_denom;
-int base_size;
-int num_unique_vals;
-int bits_for_mod;
+// Common parameters (using fixed-width for portability)
+int16_t common_denom;
+int16_t base_size;
+int16_t num_unique_vals;
+int16_t bits_for_mod;
 
 void setup() {
   common_denom = pgm_read_word_near(&common_h[0]);
@@ -16,7 +16,7 @@ void setup() {
   bits_for_mod = pgm_read_word_near(&common_h[3]);
 }
 
-void decompress_file(const char* name, const unsigned char* compressed, unsigned int original_len, unsigned long total_bits) {
+void decompress_file(const char* name, const uint8_t* compressed, unsigned int original_len, unsigned long total_bits) {
     Serial.print("File ");
     Serial.print(name);
     Serial.print(": ");
@@ -26,7 +26,7 @@ void decompress_file(const char* name, const unsigned char* compressed, unsigned
         int q = 0;
         bool q_done = false;
         while (bit_pos < total_bits) {
-            byte b = pgm_read_byte_near(&compressed[bit_pos / 8]);
+            uint8_t b = pgm_read_byte_near(&compressed[bit_pos / 8]);
             bool bit = (b >> (7 - (bit_pos % 8))) & 1;
             bit_pos++;
             if (bit) {
@@ -42,7 +42,7 @@ void decompress_file(const char* name, const unsigned char* compressed, unsigned
         int r = 0;
         for (int b_idx = 0; b_idx < bits_for_mod; b_idx++) {
             if (bit_pos < total_bits) {
-                byte b = pgm_read_byte_near(&compressed[bit_pos / 8]);
+                uint8_t b = pgm_read_byte_near(&compressed[bit_pos / 8]);
                 bool bit = (b >> (7 - (bit_pos % 8))) & 1;
                 bit_pos++;
                 r = (r << 1) | bit;
@@ -51,15 +51,14 @@ void decompress_file(const char* name, const unsigned char* compressed, unsigned
 
         int idx = q * base_size + r;
         if (idx < num_unique_vals) {
-            int val = pgm_read_word_near(&common_h[4 + idx]);
-            Serial.print(val * common_denom);
+            int16_t val = pgm_read_word_near(&common_h[4 + idx]);
+            Serial.print((int)val * common_denom);
             if (i < original_len - 1) Serial.print(",");
         }
     }
     Serial.println();
 }
 
-// This will be generated or included by the test runner
 extern std::vector<FileData> files_to_test;
 
 void loop() {

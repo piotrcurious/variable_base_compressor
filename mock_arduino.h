@@ -4,12 +4,14 @@
 #include <iostream>
 #include <iomanip>
 #include <vector>
+#include <string>
+#include <stdint.h>
 
 #define PROGMEM
-#define pgm_read_byte_near(addr) (*(const unsigned char*)(addr))
-#define pgm_read_word_near(addr) (*(const int*)(addr))
+#define pgm_read_byte_near(addr) (*(const uint8_t*)(addr))
+#define pgm_read_word_near(addr) (*(const int16_t*)(addr))
 
-typedef unsigned char byte;
+typedef uint8_t byte;
 
 class MockSerial {
 public:
