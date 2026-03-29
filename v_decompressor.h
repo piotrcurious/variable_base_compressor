@@ -10,28 +10,42 @@
 #endif
 
 typedef struct {
-    const uint8_t* compressed_data; // 2 bytes (AVR) / 4-8 bytes (others)
-    unsigned int original_len;      // 2 bytes
-    unsigned long total_bits;       // 4 bytes
-    unsigned long bit_pos;          // 4 bytes
-    unsigned int current_idx;       // 2 bytes
+    const uint8_t* compressed_data; // Pointer to compressed bytes in flash
+    unsigned int original_len;      // Original size of data
+    unsigned long total_bits;       // Total number of bits in compressed data
+    unsigned long bit_pos;          // Current bit position
+    unsigned int current_idx;       // Current byte index in original data
 
-    const int16_t* common_h_ptr;    // 2 bytes - points to flash
+    const int16_t* common_h_ptr;    // Pointer to dictionary in flash
 
-    int16_t common_denom;           // 2 bytes
-    uint8_t base_size;              // 1 byte (max 256 as per compressor)
-    int16_t num_unique_vals;        // 2 bytes
+    int16_t common_denom;           // Common multiplier for all symbols
+    int16_t base_size;              // Number of symbols per "base" level
+    int16_t num_unique_vals;        // Number of unique symbols in dictionary
 
-    uint8_t k;                      // 1 byte
-    uint8_t u;                      // 1 byte
+    uint8_t k;                      // Number of bits for truncated binary (k)
+    uint8_t u;                      // Truncated binary threshold (u)
 } VDecompressor;
 
-// Total RAM per VDecompressor: ~20-24 bytes on AVR.
+// Total RAM per VDecompressor: ~22-26 bytes on AVR.
 
+/**
+ * Helper to read a single bit from the compressed stream.
+ */
+static inline bool v_read_bit(VDecompressor* d) {
+    if (d->bit_pos >= d->total_bits) return false;
+    uint8_t b = pgm_read_byte_near(&d->compressed_data[d->bit_pos >> 3]);
+    bool bit = (b >> (7 - (d->bit_pos & 7))) & 1;
+    d->bit_pos++;
+    return bit;
+}
+
+/**
+ * Initializes the decompressor with the dictionary and compressed data.
+ */
 void v_init(VDecompressor* d, const int16_t* common_h_ptr, const uint8_t* compressed, unsigned int len, unsigned long bits) {
     d->common_h_ptr = common_h_ptr;
     d->common_denom = pgm_read_word_near(&common_h_ptr[0]);
-    d->base_size = (uint8_t)pgm_read_word_near(&common_h_ptr[1]);
+    d->base_size = pgm_read_word_near(&common_h_ptr[1]);
     d->num_unique_vals = pgm_read_word_near(&common_h_ptr[2]);
 
     d->compressed_data = compressed;
@@ -48,66 +62,71 @@ void v_init(VDecompressor* d, const int16_t* common_h_ptr, const uint8_t* compre
     d->u = (1 << (d->k + 1)) - d->base_size;
 }
 
-int v_get_next(VDecompressor* d) {
-    if (d->current_idx >= d->original_len) return -1;
+/**
+ * Decompress the next value and store it in *out.
+ * Returns true if successful, false if EOF or error.
+ */
+bool v_get_next(VDecompressor* d, int16_t* out) {
+    if (d->current_idx >= d->original_len) return false;
 
+    // 1. Read quotient (q) using unary coding
     int q = 0;
     while (d->bit_pos < d->total_bits) {
-        uint8_t b = pgm_read_byte_near(&d->compressed_data[d->bit_pos / 8]);
-        bool bit = (b >> (7 - (d->bit_pos % 8))) & 1;
-        d->bit_pos++;
-        if (bit) {
+        if (v_read_bit(d)) {
             q++;
         } else {
             break;
         }
     }
 
+    // 2. Read remainder (r) using truncated binary coding
     int r = 0;
     if (d->base_size > 1) {
-        for (int b_idx = 0; b_idx < d->k; b_idx++) {
-            if (d->bit_pos < d->total_bits) {
-                uint8_t b = pgm_read_byte_near(&d->compressed_data[d->bit_pos / 8]);
-                bool bit = (b >> (7 - (d->bit_pos % 8))) & 1;
-                d->bit_pos++;
-                r = (r << 1) | (bit ? 1 : 0);
-            }
+        // Read k bits
+        for (uint8_t b_idx = 0; b_idx < d->k; b_idx++) {
+            r = (r << 1) | (v_read_bit(d) ? 1 : 0);
         }
 
+        // If r >= u, read one more bit
         if (r >= d->u) {
-            if (d->bit_pos < d->total_bits) {
-                uint8_t b = pgm_read_byte_near(&d->compressed_data[d->bit_pos / 8]);
-                bool bit = (b >> (7 - (d->bit_pos % 8))) & 1;
-                d->bit_pos++;
-                r = (r << 1) | (bit ? 1 : 0);
-                r -= d->u;
-            }
+            r = (r << 1) | (v_read_bit(d) ? 1 : 0);
+            r -= d->u;
         }
     }
 
     d->current_idx++;
     int idx = q * d->base_size + r;
     if (idx < d->num_unique_vals) {
-        // symbols start at offset 4 in common_h
+        // dictionary symbols start at offset 4 in common_h
         int16_t symbol = pgm_read_word_near(&d->common_h_ptr[4 + idx]);
-        return (int)symbol * d->common_denom;
+        // Note: product could exceed int16_t if not careful.
+        // We return as int16_t to match dictionary type.
+        *out = (int16_t)(symbol * d->common_denom);
+        return true;
     }
-    return -1;
+    return false;
 }
 
-int v_get_at(VDecompressor* d, unsigned int index) {
-    if (index >= d->original_len) return -1;
+/**
+ * Returns the value at the specified index. Supports random access by seeking.
+ * Returns true if successful, false if index is out of bounds.
+ */
+bool v_get_at(VDecompressor* d, unsigned int index, int16_t* out) {
+    if (index >= d->original_len) return false;
 
+    // Check if we need to restart or can continue forward
     if (index < d->current_idx) {
         d->bit_pos = 0;
         d->current_idx = 0;
     }
 
+    // Seek forward until we reach the desired index
+    int16_t temp;
     while (d->current_idx < index) {
-        v_get_next(d);
+        if (!v_get_next(d, &temp)) return false;
     }
 
-    return v_get_next(d);
+    return v_get_next(d, out);
 }
 
 #endif

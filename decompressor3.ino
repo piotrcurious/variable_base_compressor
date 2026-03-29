@@ -10,53 +10,62 @@
 #include "common.h"
 #endif
 
-// In a real Arduino project, you'd include the file headers here, e.g.:
-// #include "data.csv.h"
+// Example decompressing and benchmarking
+void run_benchmark(const char* name, const uint8_t* compressed, unsigned int len, unsigned long bits) {
+    Serial.print("Testing: ");
+    Serial.println(name);
+
+    VDecompressor d;
+    v_init(&d, common_h, compressed, len, bits);
+
+    unsigned long start = micros();
+    for (unsigned int i = 0; i < len; i++) {
+        int16_t val;
+        if (v_get_next(&d, &val)) {
+            // Processing logic here
+        }
+    }
+    unsigned long end = micros();
+
+    Serial.print("  Sequential Time: ");
+    Serial.print(end - start);
+    Serial.println(" us");
+
+    // Random access benchmark (e.g. seek to middle)
+    if (len > 0) {
+        start = micros();
+        int16_t middle_val;
+        if (v_get_at(&d, len / 2, &middle_val)) {
+            Serial.print("  Middle Byte: ");
+            Serial.println(middle_val);
+        }
+        end = micros();
+        Serial.print("  Seek Time: ");
+        Serial.print(end - start);
+        Serial.println(" us");
+    }
+    Serial.println();
+}
 
 #ifdef MOCK_ARDUINO
 extern std::vector<FileData> files_to_test;
 void setup() {
-  Serial.begin(9600);
+    Serial.begin(9600);
 }
 
 void loop() {
     for (auto& f : files_to_test) {
-        Serial.print("File ");
-        Serial.print(f.name);
-        Serial.print(": ");
-
-        VDecompressor d;
-        v_init(&d, common_h, f.data, f.len, f.bits);
-
-        for (unsigned int i = 0; i < f.len; i++) {
-            int val = v_get_next(&d);
-            if (val != -1) {
-                Serial.print(val);
-                if (i < f.len - 1) Serial.print(",");
-            }
-        }
-        Serial.println();
-
-        // Example of random access:
-        if (f.len > 0) {
-            Serial.print("Byte at index ");
-            Serial.print(f.len / 2);
-            Serial.print(": ");
-            Serial.println(v_get_at(&d, f.len / 2));
-        }
+        run_benchmark(f.name, f.data, f.len, f.bits);
     }
-    // Stop after one iteration in mock
-    while(1);
+    while(1); // Stop after one iteration
 }
 #else
 void setup() {
-  Serial.begin(9600);
-  // Example initialization:
-  // VDecompressor d;
-  // v_init(&d, common_h, some_file_h, some_file_h_len, some_file_h_bits);
+    Serial.begin(9600);
+    // run_benchmark("somefile", somefile_h, somefile_h_len, somefile_h_bits);
 }
 
 void loop() {
-  // Production loop: use v_get_next(&d) or v_get_at(&d, index) as needed.
+    // Arduino production loop
 }
 #endif
