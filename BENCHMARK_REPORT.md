@@ -1,39 +1,45 @@
-# Arduino Variable-Base Decompressor Benchmark (Creative + Low-RAM)
+# Arduino Variable-Base Decompressor Benchmark (Contextual Adaptive)
 
-Generated on: 2026-03-29 12:33:32
+Generated on: 2026-03-29 20:07:35
 
 ## Summary Table
 
 | File Name | Size (B) | Speed (B/s) | Ratio | Seek (us) | Status |
 | --- | --- | --- | --- | --- | --- |
-| terrain_8kb_bin | 8192 | 31,507,700 | 1.26 | 2 | PASS |
-| image_16kb_bin | 16384 | 35,008,500 | 1.35 | 4 | PASS |
-| syslog_10kb_txt | 11982 | 18,988,900 | 1.11 | 4 | PASS |
-| sparse_1kb_bin | 1024 | 42,666,700 | 2.79 | 2 | PASS |
-| text_12kb_txt | 8707 | 19,178,400 | 1.10 | 0 | PASS |
-| map_8kb_bin | 8192 | 27,769,500 | 1.27 | 2 | PASS |
+| terrain_8kb.bin | 8192 | 21,222,800 | 1.49 | 2 | PASS |
+| image_16kb.bin | 16384 | 43,574,500 | 2.22 | 2 | PASS |
+| gradient_8kb.bin | 8192 | 38,280,400 | 2.18 | 3 | PASS |
+| syslog_10kb.txt | 11980 | 17,114,300 | 1.09 | 5 | PASS |
+| checker_4kb.bin | 4096 | 17,731,600 | 1.98 | 4 | PASS |
+| sparse_1kb.bin | 1024 | 35,310,300 | 1.98 | 3 | PASS |
+| text_12kb.txt | 8835 | 14,483,600 | 1.06 | 1 | PASS |
+| map_8kb.bin | 8192 | 22,567,500 | 1.68 | 1 | PASS |
 
 ## Performance Charts
 
 ### Decompression Speed
 ```
-terrain_8kb_bin | ██████████████░░░░░░ | 31,507,700 B/s
-image_16kb_bin  | ████████████████░░░░ | 35,008,500 B/s
-syslog_10kb_txt | ████████░░░░░░░░░░░░ | 18,988,900 B/s
-sparse_1kb_bin  | ████████████████████ | 42,666,700 B/s
-text_12kb_txt   | ████████░░░░░░░░░░░░ | 19,178,400 B/s
-map_8kb_bin     | █████████████░░░░░░░ | 27,769,500 B/s
+terrain_8kb.bin | █████████░░░░░░░░░░░ | 21,222,800 B/s
+image_16kb.bin  | ████████████████████ | 43,574,500 B/s
+gradient_8kb.bin | █████████████████░░░ | 38,280,400 B/s
+syslog_10kb.txt | ███████░░░░░░░░░░░░░ | 17,114,300 B/s
+checker_4kb.bin | ████████░░░░░░░░░░░░ | 17,731,600 B/s
+sparse_1kb.bin  | ████████████████░░░░ | 35,310,300 B/s
+text_12kb.txt   | ██████░░░░░░░░░░░░░░ | 14,483,600 B/s
+map_8kb.bin     | ██████████░░░░░░░░░░ | 22,567,500 B/s
 ```
 
 ### Compression Ratio
 ```
-terrain_8kb_bin | ████████░░░░░░░░░░░░ | 1.26x
-image_16kb_bin  | █████████░░░░░░░░░░░ | 1.35x
-syslog_10kb_txt | ███████░░░░░░░░░░░░░ | 1.11x
-sparse_1kb_bin  | ████████████████████ | 2.79x
-text_12kb_txt   | ███████░░░░░░░░░░░░░ | 1.10x
-map_8kb_bin     | █████████░░░░░░░░░░░ | 1.27x
+terrain_8kb.bin | █████████████░░░░░░░ | 1.49x
+image_16kb.bin  | ████████████████████ | 2.22x
+gradient_8kb.bin | ███████████████████░ | 2.18x
+syslog_10kb.txt | █████████░░░░░░░░░░░ | 1.09x
+checker_4kb.bin | █████████████████░░░ | 1.98x
+sparse_1kb.bin  | █████████████████░░░ | 1.98x
+text_12kb.txt   | █████████░░░░░░░░░░░ | 1.06x
+map_8kb.bin     | ███████████████░░░░░ | 1.68x
 ```
 
 ## Conclusion
-New creative optimizations (Predictive Z-order, Residual mapping) achieve better ratios within <200 bytes RAM budget.
+Context-Adaptive Base Profiles deliver high compression efficiency within <150 bytes RAM.
