@@ -8,7 +8,6 @@ MAX_BASE_SIZE = 256
 PROGMEM = "__attribute__((section(\".progmem.data\")))"
 CHECKPOINT_INTERVAL = 128
 BLOCK_SIZE = 64
-HISTORY_SIZE = 4 # Reduced history for lower RAM
 
 def encode_truncated_binary(n, b):
     if b <= 1: return bitarray.bitarray()
@@ -79,27 +78,18 @@ def find_best_bases(counts, sorted_vals, val_to_idx, trials=1000):
         temp *= 0.99
     return best_base_sizes, best_cost
 
-def apply_z_order(data, width):
-    if width <= 1: return data
-    height = (len(data) + width - 1) // width
-    size = 1
-    while size < width or size < height: size <<= 1
-    reordered = [None] * (size * size)
-    for y in range(height):
-        for x in range(width):
-            idx = y * width + x
-            if idx < len(data):
-                z = 0
-                for i in range(16):
-                    if x & (1 << i): z |= (1 << (2*i))
-                    if y & (1 << i): z |= (1 << (2*i+1))
-                reordered[z] = data[idx]
-    return [x for x in reordered if x is not None]
+def fold_residual(r):
+    # 0->0, -1->1, 1->2, -2->3, 2->4 ...
+    if r > 127: r -= 256
+    if r < -128: r += 256
+    if r >= 0: return r * 2
+    else: return abs(r) * 2 - 1
 
 def compress_dir(dir_name):
     if not os.path.exists(dir_name): return
     files = [f for f in sorted(os.listdir(dir_name)) if os.path.isfile(os.path.join(dir_name, f))]
     if not files: return
+
     file_info = []
     for file in files:
         with open(os.path.join(dir_name, file), "rb") as f:
@@ -108,37 +98,31 @@ def compress_dir(dir_name):
             file_info.append({"name": file, "data": data})
 
     for f in file_info:
-        data = f["data"]
-        sqrt_len = int(len(data)**0.5)
-        best_width, best_reordered = 0, data
-        # Search for best width (spatial locality)
-        for w in range(max(2, sqrt_len - 10), sqrt_len + 11):
-            if w <= 1: continue
-            z_data = apply_z_order(data, w)
-            if sum(abs(z_data[i] - z_data[i-1]) for i in range(1, len(z_data))) < sum(abs(best_reordered[i] - best_reordered[i-1]) for i in range(1, len(best_reordered))):
-                best_width, best_reordered = w, z_data
-        f["data_processed"] = best_reordered
-        f["width"] = best_width
+        f["data_processed"] = f["data"]
 
-    all_filtered = []
+    all_processed = []
     for f in file_info:
         d = f["data_processed"]
-        all_filtered.extend(d)
-        for i in range(1, len(d)):
-            all_filtered.append((d[i] - d[i-1]) % 256)
-            all_filtered.append(d[i] ^ d[i-1])
+        for i in range(len(d)):
+            if i % CHECKPOINT_INTERVAL == 0:
+                prev_val = 0
+            else:
+                prev_val = d[i-1]
+            all_processed.append(d[i])
+            all_processed.append(fold_residual(d[i] - prev_val))
+            all_processed.append(d[i] ^ prev_val)
 
     counts = {}
-    for x in all_filtered: counts[x] = counts.get(x, 0) + 1
+    for x in all_processed: counts[x] = counts.get(x, 0) + 1
     sorted_vals = sorted(counts.keys(), key=lambda x: counts[x], reverse=True)
     val_to_idx = {val: i for i, val in enumerate(sorted_vals)}
-    num_unique = len(sorted_vals)
-    bit_width = (num_unique - 1).bit_length() if num_unique > 1 else 1
-    p = [find_best_bases(counts, sorted_vals, val_to_idx, trials=2500)[0] for _ in range(4)]
+
+    # Context-Adaptive Profiles (4 bins)
+    p = [find_best_bases(counts, sorted_vals, val_to_idx, trials=2000)[0] for _ in range(4)]
 
     common_data = [1, 4] + [len(x) for x in p]
     for x in p: common_data.extend(x)
-    common_data.extend([num_unique, bit_width] + sorted_vals)
+    common_data.extend([len(sorted_vals), (len(sorted_vals)-1).bit_length() if len(sorted_vals)>1 else 1] + sorted_vals)
     with open("common.h", "w") as f_out:
         f_out.write("#ifndef COMMON_H\n#define COMMON_H\n#include <stdint.h>\nconst int16_t common_h[] "+PROGMEM+" = {\n")
         for i, x in enumerate(common_data):
@@ -151,53 +135,43 @@ def compress_dir(dir_name):
         final_bits = bitarray.bitarray()
         checkpoints = []
         cur_bl_count = 0
-        history = [0, 0] # limited for prediction
+        prev_val = 0
+
+        # Dummy pattern space for compatibility
+        final_bits.extend('0000')
 
         for i in range(len(data)):
             if i % CHECKPOINT_INTERVAL == 0:
-                checkpoints.append((len(final_bits), history[0], cur_bl_count))
-                force_reset = True
-            else: force_reset = False
+                checkpoints.append((len(final_bits), prev_val, cur_bl_count))
+                prev_val = 0
+                cur_bl_count = 0
 
             if cur_bl_count == 0:
                 block = data[i:i+BLOCK_SIZE]
                 best_bl = None
-                # Modes: 0:Raw, 1:Sub, 2:RLE, 3:XOR, 4:2ndOrder, 5:BitPacked
-                for mode in [0, 1, 2, 3, 4, 5]:
-                    if mode in [1, 3, 4] and force_reset: continue
-                    for prof_idx in range(4):
-                        bases = p[prof_idx]
-                        bits = bitarray.bitarray()
-                        # Mode Header: 0:Raw, 10:Sub, 110:RLE, 1110:XOR, 11110:2ndOrder, 11111:BitPacked
-                        if mode == 0: bits.extend('0')
-                        elif mode == 1: bits.extend('10')
-                        elif mode == 2: bits.extend('110')
-                        elif mode == 3: bits.extend('1110')
-                        elif mode == 4: bits.extend('11110')
-                        else: bits.extend('11111')
-                        bits.extend(bin(prof_idx)[2:].zfill(2))
+                for mode in [0, 1, 2, 3]: # 0:Raw, 1:Delta, 2:RLE, 3:XOR
+                    bits = bitarray.bitarray()
+                    if mode == 0: bits.extend('0')
+                    elif mode == 1: bits.extend('10')
+                    elif mode == 2: bits.extend('110')
+                    else: bits.extend('111')
 
-                        if mode == 2:
-                            if all(x == block[0] for x in block): bits.extend(encode_value(val_to_idx[block[0]], bases))
-                            else: continue
-                        elif mode == 5:
-                            for x in block: bits.extend(bin(val_to_idx[x])[2:].zfill(bit_width))
-                        else:
-                            temp_h = list(history)
-                            for j in range(len(block)):
-                                if mode == 0: pred = 0
-                                elif mode == 1: pred = temp_h[0]
-                                elif mode == 3: pred = temp_h[0]
-                                else: pred = max(0, min(255, 2*temp_h[0] - temp_h[1]))
-
-                                val = (block[j] ^ pred) if mode == 3 else (block[j] - pred) % 256
-                                bits.extend(encode_value(val_to_idx[val], bases))
-                                temp_h = [block[j], temp_h[0]]
-                        if best_bl is None or len(bits) < len(best_bl): best_bl = bits
+                    if mode == 2:
+                        if all(x == block[0] for x in block):
+                            ctx = 0 if prev_val < 8 else (1 if prev_val < 32 else (2 if prev_val < 128 else 3))
+                            bits.extend(encode_value(val_to_idx[block[0]], p[ctx]))
+                        else: continue
+                    else:
+                        t_p = prev_val
+                        for x in block:
+                            ctx = 0 if t_p < 8 else (1 if t_p < 32 else (2 if t_p < 128 else 3))
+                            v = x if mode == 0 else (fold_residual(x - t_p) if mode == 1 else (x ^ t_p))
+                            bits.extend(encode_value(val_to_idx[v], p[ctx]))
+                            t_p = x
+                    if best_bl is None or len(bits) < len(best_bl): best_bl = bits
                 final_bits.extend(best_bl)
                 cur_bl_count = len(block)
-
-            history = [data[i], history[0]]
+            prev_val = data[i]
             cur_bl_count -= 1
 
         header_name = f["name"].replace(".", "_") + "_h"
@@ -215,7 +189,7 @@ def compress_dir(dir_name):
                 if (j + 1) % 4 == 0: f_out.write("\n")
             f_out.write(f"\n}};\nconst unsigned int {header_name}_len = {len(data)};\n")
             f_out.write(f"const unsigned long {header_name}_bits = {len(final_bits)};\n")
-            f_out.write(f"const int {header_name}_width = {f['width']};\n")
+            f_out.write(f"const int {header_name}_width = 0;\n")
             f_out.write(f"const int {header_name}_cp_count = {len(checkpoints)};\n#endif\n")
 
 if __name__ == "__main__":

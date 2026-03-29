@@ -1,86 +1,104 @@
 // General-purpose Variable Base decompressor for Arduino
-#include "v_decompressor.h"
-
 #ifdef MOCK_ARDUINO
 #include "mock_arduino.h"
 #include "file_data.h"
 #include <vector>
-#include "common.h"
 #else
 #include "common.h"
 #endif
 
-// Example decompressing and benchmarking
-void run_benchmark(const char* name, const uint8_t* compressed, unsigned int len, unsigned long bits, int width = 0) {
-    Serial.print("Testing: ");
-    Serial.println(name);
+int16_t v_common_denom;
+int16_t v_base_size;
+int16_t v_num_unique_vals;
+const int16_t* v_sorted_symbols;
 
-    VDecompressor d;
-    v_init(&d, common_h, compressed, len, bits, width);
+void v_setup(const int16_t* common_h_ptr) {
+  v_common_denom = pgm_read_word_near(&common_h_ptr[0]);
+  v_base_size = pgm_read_word_near(&common_h_ptr[1]);
+  v_num_unique_vals = pgm_read_word_near(&common_h_ptr[2]);
+  v_sorted_symbols = &common_h_ptr[4];
+}
 
-    unsigned long start = micros();
-    unsigned int count = 0;
-    for (unsigned int i = 0; i < len; i++) {
-        int16_t val;
-        if (v_get_next(&d, &val)) {
-            count++;
-        }
+void v_decompress(const uint8_t* compressed, unsigned int original_len, unsigned long total_bits) {
+    unsigned long bit_pos = 0;
+
+    int k = 0;
+    if (v_base_size > 1) {
+        int temp = v_base_size;
+        while (temp >>= 1) k++;
     }
-    unsigned long end = micros();
+    int u = (1 << (k + 1)) - v_base_size;
 
-    if (count != len) {
-        Serial.print("  ERROR: Expected ");
-        Serial.print(len);
-        Serial.print(" bytes, got ");
-        Serial.println(count);
-    }
-
-    Serial.print("  Sequential Time: ");
-    Serial.print(end - start);
-    Serial.println(" us");
-
-    // Random access benchmark (e.g. seek to middle)
-    if (len > 0) {
-        start = micros();
-        int16_t middle_val;
-        if (v_get_at(&d, len / 2, &middle_val)) {
-            Serial.print("  Middle Byte: ");
-            Serial.println(middle_val);
+    for (unsigned int i = 0; i < original_len; i++) {
+        int q = 0;
+        bool q_done = false;
+        while (bit_pos < total_bits) {
+            uint8_t b = pgm_read_byte_near(&compressed[bit_pos / 8]);
+            bool bit = (b >> (7 - (bit_pos % 8))) & 1;
+            bit_pos++;
+            if (bit) {
+                q++;
+            } else {
+                q_done = true;
+                break;
+            }
         }
-        end = micros();
-        Serial.print("  Seek Time: ");
-        Serial.print(end - start);
-        Serial.println(" us");
+
+        if (!q_done && bit_pos >= total_bits && i < original_len) break;
+
+        int r = 0;
+        if (v_base_size > 1) {
+            for (int b_idx = 0; b_idx < k; b_idx++) {
+                if (bit_pos < total_bits) {
+                    uint8_t b = pgm_read_byte_near(&compressed[bit_pos / 8]);
+                    bool bit = (b >> (7 - (bit_pos % 8))) & 1;
+                    bit_pos++;
+                    r = (r << 1) | (bit ? 1 : 0);
+                }
+            }
+
+            if (r >= u) {
+                if (bit_pos < total_bits) {
+                    uint8_t b = pgm_read_byte_near(&compressed[bit_pos / 8]);
+                    bool bit = (b >> (7 - (bit_pos % 8))) & 1;
+                    bit_pos++;
+                    r = (r << 1) | (bit ? 1 : 0);
+                    r -= u;
+                }
+            }
+        }
+
+        int idx = q * v_base_size + r;
+        if (idx < v_num_unique_vals) {
+            int16_t symbol = pgm_read_word_near(&v_sorted_symbols[idx]);
+            Serial.print((int)symbol * v_common_denom);
+            if (i < original_len - 1) Serial.print(",");
+        }
     }
     Serial.println();
 }
 
 #ifdef MOCK_ARDUINO
-struct BenchmarkFileData {
-    const char* name;
-    const uint8_t* data;
-    unsigned int len;
-    unsigned long bits;
-    int width;
-};
-extern std::vector<BenchmarkFileData> benchmark_files;
+extern const int16_t common_h[];
+extern std::vector<FileData> files_to_test;
 void setup() {
-    Serial.begin(9600);
+  Serial.begin(9600);
+  v_setup(common_h);
 }
-
 void loop() {
-    for (auto& f : benchmark_files) {
-        run_benchmark(f.name, f.data, f.len, f.bits, f.width);
+    for (auto& f : files_to_test) {
+        Serial.print("File ");
+        Serial.print(f.name);
+        Serial.print(": ");
+        v_decompress(f.data, f.len, f.bits);
     }
-    while(1); // Stop after one iteration
 }
 #else
 void setup() {
-    Serial.begin(9600);
-    // run_benchmark("somefile", somefile_h, somefile_h_len, somefile_h_bits);
+  Serial.begin(9600);
+  v_setup(common_h);
 }
-
 void loop() {
-    // Arduino production loop
+  // Production loop: decompress and output data from common.h/file.h
 }
 #endif
