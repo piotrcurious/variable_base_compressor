@@ -11,12 +11,12 @@
 #endif
 
 // Example decompressing and benchmarking
-void run_benchmark(const char* name, const uint8_t* compressed, unsigned int len, unsigned long bits) {
+void run_benchmark(const char* name, const uint8_t* compressed, unsigned int len, unsigned long bits, int width = 0) {
     Serial.print("Testing: ");
     Serial.println(name);
 
     VDecompressor d;
-    v_init(&d, common_h, compressed, len, bits);
+    v_init(&d, common_h, compressed, len, bits, width);
 
     unsigned long start = micros();
     unsigned int count = 0;
@@ -56,14 +56,21 @@ void run_benchmark(const char* name, const uint8_t* compressed, unsigned int len
 }
 
 #ifdef MOCK_ARDUINO
-extern std::vector<FileData> files_to_test;
+struct BenchmarkFileData {
+    const char* name;
+    const uint8_t* data;
+    unsigned int len;
+    unsigned long bits;
+    int width;
+};
+extern std::vector<BenchmarkFileData> benchmark_files;
 void setup() {
     Serial.begin(9600);
 }
 
 void loop() {
-    for (auto& f : files_to_test) {
-        run_benchmark(f.name, f.data, f.len, f.bits);
+    for (auto& f : benchmark_files) {
+        run_benchmark(f.name, f.data, f.len, f.bits, f.width);
     }
     while(1); // Stop after one iteration
 }
