@@ -23,10 +23,10 @@ typedef struct {
     int16_t num_unique_vals;        // Number of unique symbols in dictionary
 
     uint8_t k;                      // Number of bits for truncated binary (k)
-    uint8_t u;                      // Truncated binary threshold (u)
+    int16_t u;                      // Truncated binary threshold (u)
 } VDecompressor;
 
-// Total RAM per VDecompressor: ~22-26 bytes on AVR.
+// Total RAM per VDecompressor: ~23-27 bytes on AVR.
 
 /**
  * Helper to read a single bit from the compressed stream.

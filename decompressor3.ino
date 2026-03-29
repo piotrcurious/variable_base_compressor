@@ -19,13 +19,21 @@ void run_benchmark(const char* name, const uint8_t* compressed, unsigned int len
     v_init(&d, common_h, compressed, len, bits);
 
     unsigned long start = micros();
+    unsigned int count = 0;
     for (unsigned int i = 0; i < len; i++) {
         int16_t val;
         if (v_get_next(&d, &val)) {
-            // Processing logic here
+            count++;
         }
     }
     unsigned long end = micros();
+
+    if (count != len) {
+        Serial.print("  ERROR: Expected ");
+        Serial.print(len);
+        Serial.print(" bytes, got ");
+        Serial.println(count);
+    }
 
     Serial.print("  Sequential Time: ");
     Serial.print(end - start);
