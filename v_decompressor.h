@@ -1,4 +1,4 @@
-// General-purpose Variable Base decompressor for Arduino (with Nesting and Z-order)
+// General-purpose Variable Base decompressor for Arduino (Optimized v10)
 #ifndef V_DECOMPRESSOR_H
 #define V_DECOMPRESSOR_H
 
@@ -8,6 +8,10 @@
 #include <Arduino.h>
 #include <avr/pgmspace.h>
 #endif
+
+#define BLOCK_SIZE 64
+#define CP_INTERVAL 128
+#define MAX_WIDTH 256
 
 typedef struct {
     const uint8_t* compressed_data;
@@ -19,169 +23,179 @@ typedef struct {
     const int16_t* common_h_ptr;
     int16_t common_denom;
     int16_t num_unique_vals;
+    int16_t bit_width;
+    int16_t num_profiles;
+    const int16_t* profile_bases[4];
+    int16_t profile_lens[4];
+    const int16_t* symbols_ptr;
 
-    int16_t num_bases;
-    const int16_t* base_sizes;
+    int8_t block_mode; // 0..7
+    int8_t block_profile;
+    int16_t rle_val;
+    unsigned int block_count;
 
-    int16_t width; // Z-order width (0 if none)
-    int8_t mode;   // 0: raw, 1: delta
-    int16_t prev_val;
+    int16_t width;
+    const uint16_t* cp_ptr;
+    int16_t cp_count;
+
+    uint8_t line_buffer[MAX_WIDTH];
+    uint8_t prev_line_a;
+    int16_t prev_val_1d;
 
     uint8_t cached_byte;
-    int8_t cached_idx; // 7 to 0, -1 means no cache
+    int8_t cached_idx;
 } VDecompressor;
 
 static inline bool v_read_bit(VDecompressor* d) {
     if (d->bit_pos >= d->total_bits) return false;
-
     int8_t bit_offset = 7 - (d->bit_pos & 7);
     if (d->cached_idx != bit_offset + 1 && d->cached_idx != bit_offset) {
         d->cached_byte = pgm_read_byte_near(&d->compressed_data[d->bit_pos >> 3]);
     }
-
     bool bit = (d->cached_byte >> bit_offset) & 1;
-    d->bit_pos++;
-    d->cached_idx = bit_offset;
+    d->bit_pos++; d->cached_idx = bit_offset;
     return bit;
 }
 
-void v_init(VDecompressor* d, const int16_t* common_h_ptr, const uint8_t* compressed, unsigned int len, unsigned long bits, int width = 0, int mode = 0) {
+void v_init(VDecompressor* d, const int16_t* common_h_ptr, const uint8_t* compressed, unsigned int len, unsigned long bits, int width = 0, const uint16_t* cp = 0, int cp_count = 0) {
     d->common_h_ptr = common_h_ptr;
     d->common_denom = pgm_read_word_near(&common_h_ptr[0]);
-    d->num_bases = pgm_read_word_near(&common_h_ptr[1]);
-    d->base_sizes = &common_h_ptr[2];
-    d->num_unique_vals = pgm_read_word_near(&common_h_ptr[2 + d->num_bases]);
-
-    d->compressed_data = compressed;
-    d->original_len = len;
-    d->total_bits = bits;
-    d->bit_pos = 0;
-    d->current_idx = 0;
-    d->width = width;
-    d->mode = (int8_t)mode;
-    d->prev_val = 0;
-    d->cached_idx = -1;
+    d->num_profiles = pgm_read_word_near(&common_h_ptr[1]);
+    int offset = 2 + d->num_profiles;
+    for (int i=0; i<d->num_profiles; i++) {
+        d->profile_lens[i] = pgm_read_word_near(&common_h_ptr[2 + i]);
+        d->profile_bases[i] = &common_h_ptr[offset];
+        offset += d->profile_lens[i];
+    }
+    d->num_unique_vals = pgm_read_word_near(&common_h_ptr[offset]);
+    d->bit_width = pgm_read_word_near(&common_h_ptr[offset + 1]);
+    d->symbols_ptr = &common_h_ptr[offset + 2];
+    d->compressed_data = compressed; d->original_len = len; d->total_bits = bits;
+    d->bit_pos = 0; d->current_idx = 0; d->block_count = 0; d->cached_idx = -1;
+    d->width = width; d->cp_ptr = cp; d->cp_count = cp_count;
+    d->prev_val_1d = 0; d->prev_line_a = 0;
+    for (int i=0; i<MAX_WIDTH; i++) d->line_buffer[i] = 0;
 }
 
 static int16_t v_read_truncated(VDecompressor* d, int16_t b) {
     if (b <= 1) return 0;
-    int k = 0;
-    int temp = b;
+    int k = 0, temp = b;
     while (temp >>= 1) k++;
     int16_t u = (1 << (k + 1)) - b;
-
     int16_t r = 0;
-    for (int i = 0; i < k; i++) {
-        r = (r << 1) | (v_read_bit(d) ? 1 : 0);
-    }
-    if (r >= u) {
-        r = (r << 1) | (v_read_bit(d) ? 1 : 0);
-        r -= u;
-    }
+    for (int i = 0; i < k; i++) r = (r << 1) | (v_read_bit(d) ? 1 : 0);
+    if (r >= u) { r = (r << 1) | (v_read_bit(d) ? 1 : 0); r -= u; }
     return r;
+}
+
+static int16_t v_decode_val(VDecompressor* d) {
+    int32_t idx = 0, multiplier = 1;
+    int16_t n_b = d->profile_lens[d->block_profile];
+    const int16_t* b_ptr = d->profile_bases[d->block_profile];
+    for (int i = 0; i < n_b; i++) {
+        int16_t b = pgm_read_word_near(&b_ptr[i]);
+        idx += (int32_t)v_read_truncated(d, b) * multiplier;
+        multiplier *= (int32_t)b;
+        if (!v_read_bit(d)) goto found;
+        idx += multiplier;
+    }
+    { int q = 0; while (v_read_bit(d)) q++; idx += (int32_t)q * multiplier; }
+found:
+    if (idx < (int32_t)d->num_unique_vals) return (int16_t)(pgm_read_word_near(&d->symbols_ptr[idx]) * d->common_denom);
+    return 0;
 }
 
 bool v_get_next(VDecompressor* d, int16_t* out) {
     if (d->current_idx >= d->original_len) return false;
-
-    int32_t idx = 0;
-    int32_t multiplier = 1;
-
-    for (int i = 0; i < d->num_bases; i++) {
-        int16_t b = pgm_read_word_near(&d->base_sizes[i]);
-        int16_t r = v_read_truncated(d, b);
-        idx += (int32_t)r * multiplier;
-        multiplier *= (int32_t)b;
-
-        if (!v_read_bit(d)) {
-            goto found;
+    if (d->block_count == 0) {
+        if (!v_read_bit(d)) d->block_mode = 0;
+        else if (!v_read_bit(d)) d->block_mode = 1;
+        else if (!v_read_bit(d)) d->block_mode = 2;
+        else if (!v_read_bit(d)) d->block_mode = 3;
+        else if (!v_read_bit(d)) d->block_mode = 4;
+        else if (!v_read_bit(d)) d->block_mode = 5;
+        else if (!v_read_bit(d)) d->block_mode = 6;
+        else d->block_mode = 7;
+        d->block_profile = (v_read_bit(d) ? 2 : 0) | (v_read_bit(d) ? 1 : 0);
+        d->block_count = (d->original_len - d->current_idx < BLOCK_SIZE) ? (d->original_len - d->current_idx) : BLOCK_SIZE;
+        if (d->block_mode == 2) d->rle_val = v_decode_val(d);
+    }
+    int16_t val;
+    if (d->block_mode == 2) val = d->rle_val;
+    else if (d->block_mode == 7) {
+        int32_t idx = 0;
+        for (int i = 0; i < d->bit_width; i++) idx = (idx << 1) | (v_read_bit(d) ? 1 : 0);
+        val = (int16_t)(pgm_read_word_near(&d->symbols_ptr[idx]) * d->common_denom);
+    } else {
+        val = v_decode_val(d);
+        int x = d->width > 0 ? (d->current_idx % d->width) : 0;
+        int y = d->width > 0 ? (d->current_idx / d->width) : 0;
+        uint8_t a = (d->width == 0) ? (uint8_t)d->prev_val_1d : ((x > 0) ? d->line_buffer[x-1] : 0);
+        uint8_t b = (d->width > 0 && y > 0) ? d->line_buffer[x] : 0;
+        uint8_t c = (d->width > 0 && x > 0 && y > 0) ? d->prev_line_a : 0;
+        if (d->block_mode == 1) val = (int16_t)((a + val) % 256);
+        else if (d->block_mode == 3) val = (int16_t)(a ^ val);
+        else if (d->block_mode == 4) val = (int16_t)((b + val) % 256);
+        else if (d->block_mode == 5) val = (int16_t)((((uint16_t)a + b) / 2 + val) % 256);
+        else if (d->block_mode == 6) {
+            int16_t p = (int16_t)a + (int16_t)b - (int16_t)c;
+            int16_t pa = abs(p - a), pb = abs(p - b), pc = abs(p - c);
+            uint8_t pr = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+            val = (int16_t)((pr + val) % 256);
         }
-        idx += multiplier;
     }
-
-    {
-        int q = 0;
-        while (v_read_bit(d)) q++;
-        idx += (int32_t)q * multiplier;
+    // Always update context
+    if (d->width > 0 && d->width <= MAX_WIDTH) {
+        d->prev_line_a = d->line_buffer[d->current_idx % d->width];
+        d->line_buffer[d->current_idx % d->width] = (uint8_t)val;
     }
-
-found:
-    d->current_idx++;
-    if (idx < (int32_t)d->num_unique_vals) {
-        int16_t symbol = pgm_read_word_near(&d->common_h_ptr[4 + d->num_bases + idx]);
-        int16_t current = (int16_t)(symbol * d->common_denom);
-
-        if (d->mode == 1) { // delta
-            current = (int16_t)((d->prev_val + current) % 256);
-            d->prev_val = current;
-        }
-
-        *out = current;
-        return true;
-    }
-    return false;
+    d->prev_val_1d = val;
+    d->current_idx++; d->block_count--; *out = val; return true;
 }
 
-// Z-order ranking support for random access
 static inline uint32_t compact_1d(uint32_t n) {
-    n &= 0x55555555;
-    n = (n | (n >> 1)) & 0x33333333;
-    n = (n | (n >> 2)) & 0x0f0f0f0f;
-    n = (n | (n >> 4)) & 0x00ff00ff;
-    n = (n | (n >> 8)) & 0x0000ffff;
-    return n;
+    n &= 0x55555555; n = (n | (n >> 1)) & 0x33333333; n = (n | (n >> 2)) & 0x0f0f0f0f; n = (n | (n >> 4)) & 0x00ff00ff; n = (n | (n >> 8)) & 0x0000ffff; return n;
 }
-
-static inline void z_order_decode(uint32_t z, uint32_t* x, uint32_t* y) {
-    *x = compact_1d(z);
-    *y = compact_1d(z >> 1);
-}
-
+static inline void z_order_decode(uint32_t z, uint32_t* x, uint32_t* y) { *x = compact_1d(z); *y = compact_1d(z >> 1); }
 static inline uint32_t part1d(uint32_t n) {
-    n &= 0x0000ffff;
-    n = (n | (n << 8)) & 0x00ff00ff;
-    n = (n | (n << 4)) & 0x0f0f0f0f;
-    n = (n | (n << 2)) & 0x33333333;
-    n = (n | (n << 1)) & 0x55555555;
-    return n;
+    n &= 0x0000ffff; n = (n | (n << 8)) & 0x00ff00ff; n = (n | (n << 4)) & 0x0f0f0f0f; n = (n | (n << 2)) & 0x33333333; n = (n | (n << 1)) & 0x55555555; return n;
 }
-
-static inline uint32_t z_order_encode(uint32_t x, uint32_t y) {
-    return (part1d(y) << 1) | part1d(x);
-}
+static inline uint32_t z_order_encode(uint32_t x, uint32_t y) { return (part1d(y) << 1) | part1d(x); }
 
 bool v_get_at(VDecompressor* d, unsigned int index, int16_t* out) {
     if (index >= d->original_len) return false;
-
-    unsigned int target_rank = index;
+    unsigned int tr = index;
     if (d->width > 0) {
-        uint32_t x_target = index % d->width;
-        uint32_t y_target = index / d->width;
-        uint32_t z_target = z_order_encode(x_target, y_target);
-
-        target_rank = 0;
-        for (uint32_t z = 0; z < z_target; z++) {
-            uint32_t cur_x, cur_y;
-            z_order_decode(z, &cur_x, &cur_y);
-            if (cur_x < (uint32_t)d->width && (cur_y * (uint32_t)d->width + cur_x) < d->original_len) {
-                target_rank++;
+        uint32_t xt = index % d->width, yt = index / d->width, zt = z_order_encode(xt, yt);
+        if ((d->width & (d->width - 1)) == 0 && (unsigned long)d->width * d->width <= d->original_len) tr = zt;
+        else {
+            tr = 0;
+            for (uint32_t z = 0; z < zt; z++) {
+                uint32_t cx, cy; z_order_decode(z, &cx, &cy);
+                if (cx < (uint32_t)d->width && (cy * (uint32_t)d->width + cx) < d->original_len) tr++;
             }
         }
     }
-
-    if (target_rank < d->current_idx) {
-        d->bit_pos = 0;
-        d->current_idx = 0;
-        d->prev_val = 0;
-        d->cached_idx = -1;
+    if (d->cp_ptr && (tr < d->current_idx || tr > d->current_idx + 16)) {
+        int cp_i = tr / CP_INTERVAL;
+        if (cp_i < d->cp_count) {
+            uint32_t bp = pgm_read_word_near(&d->cp_ptr[cp_i * 3 + 0]);
+            bp |= ((uint32_t)pgm_read_word_near(&d->cp_ptr[cp_i * 3 + 1]) << 16);
+            uint16_t blc = pgm_read_word_near(&d->cp_ptr[cp_i * 3 + 2]);
+            d->bit_pos = bp; d->current_idx = cp_i * CP_INTERVAL; d->block_count = blc; d->cached_idx = -1;
+            d->prev_val_1d = 0; d->prev_line_a = 0;
+            for (int i=0; i<MAX_WIDTH; i++) d->line_buffer[i] = 0;
+        } else if (tr < d->current_idx) {
+            d->bit_pos = 0; d->current_idx = 0; d->block_count = 0; d->cached_idx = -1;
+            d->prev_val_1d = 0; d->prev_line_a = 0;
+            for (int i=0; i<MAX_WIDTH; i++) d->line_buffer[i] = 0;
+        }
+    } else if (tr < d->current_idx) {
+        d->bit_pos = 0; d->current_idx = 0; d->block_count = 0; d->cached_idx = -1;
+        d->prev_val_1d = 0; d->prev_line_a = 0;
+        for (int i=0; i<MAX_WIDTH; i++) d->line_buffer[i] = 0;
     }
-
-    int16_t temp;
-    while (d->current_idx < target_rank) {
-        if (!v_get_next(d, &temp)) return false;
-    }
-
+    int16_t temp; while (d->current_idx < tr) if (!v_get_next(d, &temp)) return false;
     return v_get_next(d, out);
 }
-
 #endif

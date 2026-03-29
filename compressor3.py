@@ -6,34 +6,8 @@ import random
 # Constants
 MAX_BASE_SIZE = 256
 PROGMEM = "__attribute__((section(\".progmem.data\")))"
-
-def part1d(n):
-    n &= 0x0000ffff
-    n = (n | (n << 8)) & 0x00ff00ff
-    n = (n | (n << 4)) & 0x0f0f0f0f
-    n = (n | (n << 2)) & 0x33333333
-    n = (n | (n << 1)) & 0x55555555
-    return n
-
-def z_order_encode(x, y):
-    return (part1d(y) << 1) | part1d(x)
-
-def apply_z_order(data, width):
-    if width <= 1: return data
-    height = (len(data) + width - 1) // width
-    size = 1
-    while size < width or size < height:
-        size <<= 1
-
-    reordered = [None] * (size * size)
-    for y in range(height):
-        for x in range(width):
-            idx = y * width + x
-            if idx < len(data):
-                z = z_order_encode(x, y)
-                reordered[z] = data[idx]
-
-    return [x for x in reordered if x is not None]
+CHECKPOINT_INTERVAL = 128
+BLOCK_SIZE = 64
 
 def encode_truncated_binary(n, b):
     if b <= 1: return bitarray.bitarray()
@@ -60,13 +34,12 @@ def encode_value(idx, base_sizes):
     for i, b in enumerate(base_sizes):
         r = curr_idx % b
         q = curr_idx // b
-        if b > 1:
-            res.extend(encode_truncated_binary(r, b))
+        if b > 1: res.extend(encode_truncated_binary(r, b))
         if q > 0:
-            res.append(True) # more levels
-            curr_idx = q - 1 # offset to allow 0 to be meaningful
+            res.append(True)
+            curr_idx = q - 1
         else:
-            res.append(False) # end of nesting
+            res.append(False)
             break
     else:
         res.extend('1' * (curr_idx))
@@ -79,144 +52,191 @@ def cost_value(idx, base_sizes):
     for i, b in enumerate(base_sizes):
         r = curr_idx % b
         q = curr_idx // b
-        if b > 1:
-            bits += calculate_bits_truncated(r, b)
-        bits += 1 # nesting bit
-        if q > 0:
-            curr_idx = q - 1
-        else:
-            break
-    else:
-        bits += curr_idx + 1 # unary fallback
+        if b > 1: bits += calculate_bits_truncated(r, b)
+        bits += 1
+        if q > 0: curr_idx = q - 1
+        else: break
+    else: bits += curr_idx + 1
     return bits
 
-def find_best_bases(counts, sorted_vals, val_to_idx):
+def find_best_bases(counts, sorted_vals, val_to_idx, trials=1000):
     best_base_sizes = [32]
-    best_cost = sum(counts[v] * cost_value(val_to_idx[v], best_base_sizes) for v in sorted_vals)
-
-    for _ in range(1000): # Increased iterations
+    best_cost = sum(counts.get(v, 0) * cost_value(val_to_idx[v], best_base_sizes) for v in sorted_vals)
+    temp = 1.0
+    for _ in range(trials):
         new_bases = list(best_base_sizes)
-        # Random mutation
-        rand_val = random.random()
-        if rand_val < 0.2 and len(new_bases) < 5: # Up to 5 levels
-            new_bases.append(random.randint(2, 64))
-        elif rand_val < 0.4 and len(new_bases) > 1:
-            new_bases.pop()
+        rv = random.random()
+        if rv < 0.2 and len(new_bases) < 5: new_bases.append(random.randint(2, 64))
+        elif rv < 0.4 and len(new_bases) > 1: new_bases.pop()
         else:
             idx = random.randrange(len(new_bases))
-            new_bases[idx] = max(1, min(256, new_bases[idx] + random.randint(-8, 8)))
-
-        cost = sum(counts[v] * cost_value(val_to_idx[v], new_bases) for v in sorted_vals)
-        if cost < best_cost:
+            new_bases[idx] = max(1, min(256, new_bases[idx] + random.randint(-16, 16)))
+        cost = sum(counts.get(v, 0) * cost_value(val_to_idx[v], new_bases) for v in sorted_vals)
+        if cost < best_cost or random.random() < math.exp((best_cost - cost) / (temp + 1e-9)):
             best_cost = cost
             best_base_sizes = new_bases
-
+        temp *= 0.99
     return best_base_sizes, best_cost
+
+def apply_z_order(data, width):
+    if width <= 1: return data
+    height = (len(data) + width - 1) // width
+    size = 1
+    while size < width or size < height: size <<= 1
+    reordered = [None] * (size * size)
+    for y in range(height):
+        for x in range(width):
+            idx = y * width + x
+            if idx < len(data):
+                z = 0
+                for i in range(16):
+                    if x & (1 << i): z |= (1 << (2*i))
+                    if y & (1 << i): z |= (1 << (2*i+1))
+                reordered[z] = data[idx]
+    return [x for x in reordered if x is not None]
 
 def compress_dir(dir_name):
     if not os.path.exists(dir_name): return
-
     files = [f for f in sorted(os.listdir(dir_name)) if os.path.isfile(os.path.join(dir_name, f))]
     if not files: return
 
-    file_data_list = []
+    file_info = []
     for file in files:
         with open(os.path.join(dir_name, file), "rb") as f:
             data = list(f.read())
             if not data: continue
-            file_data_list.append({"name": file, "data": data, "original": list(data)})
-    
-    if not file_data_list: return
+            file_info.append({"name": file, "data": data})
 
-    for fd in file_data_list:
-        best_mode = "raw"
-        best_width = 0
-        best_local_cost = 1e18
+    for f in file_info:
+        data = f["data"]
+        sqrt_len = int(len(data)**0.5)
+        best_width, best_reordered = 0, data
+        z_data = apply_z_order(data, sqrt_len)
+        if sum(abs(z_data[i] - z_data[i-1]) for i in range(1, len(z_data))) < sum(abs(data[i] - data[i-1]) for i in range(1, len(data))):
+            best_width, best_reordered = sqrt_len, z_data
+        f["data_processed"] = best_reordered
+        f["width"] = best_width
 
-        original_data = fd["data"]
+    all_filtered = []
+    for f in file_info:
+        d = f["data_processed"]
+        all_filtered.extend(d)
+        all_filtered.extend([d[0]] + [(d[i] - d[i-1]) % 256 for i in range(1, len(d))])
 
-        for delta in [False, True]:
-            current_data = original_data
-            if delta:
-                current_data = [original_data[0]] + [(original_data[i] - original_data[i-1]) % 256 for i in range(1, len(original_data))]
-
-            # Test 1D cost
-            counts = {}
-            for x in current_data: counts[x] = counts.get(x, 0) + 1
-            sorted_vals = sorted(counts.keys(), key=lambda x: counts[x], reverse=True)
-            val_to_idx = {val: i for i, val in enumerate(sorted_vals)}
-            bases, cost = find_best_bases(counts, sorted_vals, val_to_idx)
-
-            if cost < best_local_cost:
-                best_local_cost = cost
-                best_mode = "delta" if delta else "raw"
-                best_width = 0
-                fd["data_processed"] = current_data
-
-            # Test 2D cost (Z-order)
-            sqrt_len = int(len(current_data)**0.5)
-            # Try more widths around sqrt(len)
-            for w in range(max(2, sqrt_len - 10), sqrt_len + 11):
-                z_data = apply_z_order(current_data, w)
-                counts_z = {}
-                for x in z_data: counts_z[x] = counts_z.get(x, 0) + 1
-                sorted_vals_z = sorted(counts_z.keys(), key=lambda x: counts_z[x], reverse=True)
-                val_to_idx_z = {val: i for i, val in enumerate(sorted_vals_z)}
-                bases_z, cost_z = find_best_bases(counts_z, sorted_vals_z, val_to_idx_z)
-                if cost_z < best_local_cost:
-                    best_local_cost = cost_z
-                    best_width = w
-                    best_mode = "delta" if delta else "raw"
-                    fd["data_processed"] = z_data
-
-        fd["width"] = best_width
-        fd["mode"] = best_mode
-        print(f"File {fd['name']} using {best_mode} mode, Z-order width {best_width}")
-
-    # Final overall dictionary
-    all_reordered_data = [x for fd in file_data_list for x in fd["data_processed"]]
     counts = {}
-    for x in all_reordered_data: counts[x] = counts.get(x, 0) + 1
+    for x in all_filtered: counts[x] = counts.get(x, 0) + 1
     sorted_vals = sorted(counts.keys(), key=lambda x: counts[x], reverse=True)
     val_to_idx = {val: i for i, val in enumerate(sorted_vals)}
-    best_base_sizes, _ = find_best_bases(counts, sorted_vals, val_to_idx)
-    print(f"Final Optimal Bases: {best_base_sizes}")
 
-    common_data = [1, len(best_base_sizes)] + best_base_sizes + [len(sorted_vals), 0] + sorted_vals
-    with open("common.h", "w") as f:
-        f.write("#ifndef COMMON_H\n#define COMMON_H\n#include <stdint.h>\n\n")
-        f.write(f"const int16_t common_h[] {PROGMEM} = {{\n")
+    num_unique = len(sorted_vals)
+    bit_width = (num_unique - 1).bit_length() if num_unique > 1 else 1
+    p = [find_best_bases(counts, sorted_vals, val_to_idx, trials=2500)[0] for _ in range(4)]
+
+    common_data = [1, 4] + [len(x) for x in p]
+    for x in p: common_data.extend(x)
+    common_data.extend([num_unique, bit_width] + sorted_vals)
+    with open("common.h", "w") as f_out:
+        f_out.write("#ifndef COMMON_H\n#define COMMON_H\n#include <stdint.h>\nconst int16_t common_h[] "+PROGMEM+" = {\n")
         for i, x in enumerate(common_data):
-            f.write(str(int(x)))
-            if i < len(common_data) - 1: f.write(", ")
-            if (i+1) % 12 == 0: f.write("\n")
-        f.write("\n};\n\n#endif\n")
+            f_out.write(str(int(x)) + (", " if i < len(common_data)-1 else ""))
+            if (i+1)%12==0: f_out.write("\n")
+        f_out.write("\n};\n#endif\n")
 
-    for fd in file_data_list:
-        encoded = bitarray.bitarray()
-        for x in fd["data_processed"]:
-            encoded.extend(encode_value(val_to_idx[x], best_base_sizes))
+    for f in file_info:
+        data = f["data_processed"]
+        width = f["width"]
+        final_bits = bitarray.bitarray()
+        checkpoints = []
+        cur_bl_count = 0
+        line_buf = [0] * (width if width > 0 else 1)
+        prev_line_a = 0
+        cur_prev_1d = 0
+        for i in range(len(data)):
+            if i % CHECKPOINT_INTERVAL == 0:
+                checkpoints.append((len(final_bits), 0, cur_bl_count))
+                cur_prev_1d = 0
+                prev_line_a = 0
+                line_buf = [0] * len(line_buf)
+                force_reset = True
+            else: force_reset = False
 
-        header_name = fd["name"].replace(".", "_") + "_h"
-        filename = fd["name"] + ".h"
-        with open(filename, "w") as f:
-            guard = filename.upper().replace(".", "_")
-            f.write(f"#ifndef {guard}\n#define {guard}\n#include <stdint.h>\n\n")
-            f.write(f"const uint8_t {header_name}[] {PROGMEM} = {{\n")
-            bytes_data = encoded.tobytes()
+            if cur_bl_count == 0:
+                block = data[i:i+BLOCK_SIZE]
+                best_bl = None
+                for mode in [0, 1, 2, 3, 4, 5, 6, 7]:
+                    if mode in [1,3,4,5,6] and force_reset: continue
+                    if mode >= 4 and width == 0: continue
+                    if mode == 7 and bit_width == 0: continue
+                    for prof_idx in range(4):
+                        bases = p[prof_idx]
+                        bits = bitarray.bitarray()
+                        if mode == 0: bits.extend('0')
+                        elif mode == 1: bits.extend('10')
+                        elif mode == 2: bits.extend('110')
+                        elif mode == 3: bits.extend('1110')
+                        elif mode == 4: bits.extend('11110')
+                        elif mode == 5: bits.extend('111110')
+                        elif mode == 6: bits.extend('1111110')
+                        else: bits.extend('1111111')
+                        bits.extend(bin(prof_idx)[2:].zfill(2))
+                        if mode == 2:
+                            if all(x == block[0] for x in block): bits.extend(encode_value(val_to_idx[block[0]], bases))
+                            else: continue
+                        elif mode == 7:
+                            for x in block: bits.extend(bin(val_to_idx[x])[2:].zfill(bit_width))
+                        else:
+                            t_line = list(line_buf)
+                            t_prev_a = prev_line_a
+                            t_prev_1d = cur_prev_1d
+                            for j in range(len(block)):
+                                idx_g = i + j
+                                x = idx_g % width if width > 0 else 0
+                                a = t_prev_1d if width == 0 else (t_line[x-1] if x > 0 else 0)
+                                b = t_line[x] if width > 0 and (idx_g >= width) else 0
+                                c = t_prev_a if width > 0 and x > 0 and (idx_g >= width) else 0
+                                if mode == 0: pr = 0
+                                elif mode == 1: pr = a
+                                elif mode == 3: pr = a
+                                elif mode == 4: pr = b
+                                elif mode == 5: pr = (int(a) + b) // 2
+                                else:
+                                    pt = int(a) + b - c
+                                    pa, pb, pc = abs(pt-a), abs(pt-b), abs(pt-c)
+                                    pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                                bits.extend(encode_value(val_to_idx[(block[j] - pr) % 256] if mode != 3 else val_to_idx[block[j] ^ pr], bases))
+                                if width > 0:
+                                    t_prev_a = t_line[x]
+                                    t_line[x] = block[j]
+                                t_prev_1d = block[j]
+                        if best_bl is None or len(bits) < len(best_bl): best_bl = bits
+                final_bits.extend(best_bl)
+                cur_bl_count = len(block)
+            if width > 0:
+                prev_line_a = line_buf[i % width]
+                line_buf[i % width] = data[i]
+            cur_prev_1d = data[i]
+            cur_bl_count -= 1
+
+        header_name = f["name"].replace(".", "_") + "_h"
+        with open(f["name"]+".h", "w") as f_out:
+            guard = f["name"].upper().replace(".", "_")
+            f_out.write(f"#ifndef {guard}\n#define {guard}\n#include <stdint.h>\nconst uint8_t {header_name}[] "+PROGMEM+" = {\n")
+            bytes_data = final_bits.tobytes()
             for j, x in enumerate(bytes_data):
-                f.write(f"0x{x:02x}")
-                if j < len(bytes_data) - 1: f.write(", ")
-                if (j + 1) % 12 == 0: f.write("\n")
-            f.write(f"\n}};\n\nconst unsigned int {header_name}_len = {len(fd['data_processed'])};\n")
-            f.write(f"const unsigned long {header_name}_bits = {len(encoded)};\n")
-            f.write(f"const int {header_name}_width = {fd['width']};\n")
-            f.write(f"const int {header_name}_mode = {'1' if fd['mode'] == 'delta' else '0'};\n")
-            f.write("#endif\n")
+                f_out.write(f"0x{x:02x}" + (", " if j < len(bytes_data)-1 else ""))
+                if (j+1)%12==0: f_out.write("\n")
+            f_out.write(f"\n}};\nconst uint16_t {header_name}_cp[] "+PROGMEM+" = {\n")
+            for j, cp in enumerate(checkpoints):
+                f_out.write(f"{cp[0] & 0xFFFF}, {(cp[0] >> 16) & 0xFFFF}, {cp[2]}")
+                if j < len(checkpoints) - 1: f_out.write(", ")
+                if (j + 1) % 4 == 0: f_out.write("\n")
+            f_out.write(f"\n}};\nconst unsigned int {header_name}_len = {len(data)};\n")
+            f_out.write(f"const unsigned long {header_name}_bits = {len(final_bits)};\n")
+            f_out.write(f"const int {header_name}_width = {f['width']};\n")
+            f_out.write(f"const int {header_name}_cp_count = {len(checkpoints)};\n#endif\n")
 
 if __name__ == "__main__":
     import sys
-    dir_name = "diverse_test_dir"
-    if len(sys.argv) > 1:
-        dir_name = sys.argv[1]
+    dir_name = "benchmark_data"
+    if len(sys.argv) > 1: dir_name = sys.argv[1]
     compress_dir(dir_name)
