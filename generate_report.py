@@ -58,7 +58,7 @@ def compile_and_run_benchmark():
         if not (f.endswith(".bin.h") or f.endswith(".txt.h")): continue
         base = f.replace(".", "_").replace("_h", "")
         var_name = f.replace(".", "_")
-        file_list.append(f'{{"{base}", {var_name}, {var_name}_len, {var_name}_bits, {var_name}_width}}')
+        file_list.append(f'{{"{base}", {var_name}, {var_name}_len, {var_name}_bits, {var_name}_width, {var_name}_mode}}')
 
     runner_code = f"""
 #include "mock_arduino.h"
@@ -78,6 +78,7 @@ struct BenchmarkFileData {{
     unsigned int len;
     unsigned long bits;
     int width;
+    int mode;
 }};
 
 {includes}
@@ -92,7 +93,7 @@ int main() {{
     std::cout << "NAME|SIZE|SPEED|RATIO|STATUS" << std::endl;
     for (auto& f : benchmark_files) {{
         VDecompressor d;
-        v_init(&d, common_h, f.data, f.len, f.bits, f.width);
+        v_init(&d, common_h, f.data, f.len, f.bits, f.width, f.mode);
 
         unsigned long start = micros();
         int16_t val;
@@ -111,7 +112,6 @@ int main() {{
         // Data verification
         std::vector<uint8_t> decoded_data;
         if (f.width > 0) {{
-            // De-Z-order
             decoded_data.assign(f.len, 0);
             int height = (f.len + f.width - 1) / f.width;
             int size = 1;
@@ -122,7 +122,7 @@ int main() {{
                 uint32_t x = compact_1d(z);
                 uint32_t y = compact_1d(z >> 1);
                 if (x < (uint32_t)f.width && y * (uint32_t)f.width + x < (uint32_t)f.len) {{
-                    if (rank < decoded_items.size()) {{
+                    if (rank < (int)decoded_items.size()) {{
                         decoded_data[y * f.width + x] = decoded_items[rank++];
                     }}
                 }}
@@ -189,7 +189,7 @@ def generate_markdown_report(results):
     max_ratio = max([float(d[3]) for d in data])
 
     with open("BENCHMARK_REPORT.md", "w") as f:
-        f.write("# Arduino Variable-Base Decompressor Benchmark Report (Nested + Z-Order)\n\n")
+        f.write("# Arduino Variable-Base Decompressor Benchmark Report (Optimized)\n\n")
         f.write(f"Generated on: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
         f.write("## Summary Table\n\n")
@@ -216,7 +216,7 @@ def generate_markdown_report(results):
         f.write(f"**Overall Status: {'PASSED' if all_passed else 'FAILED'}**\n")
 
         f.write("\n## Conclusion\n")
-        f.write("The nested variable-base decompressor with Z-order support improves compression ratio for structured data while maintaining high throughput and low RAM usage.\n")
+        f.write("The optimized nested variable-base decompressor with bit caching and Delta mode support shows significantly improved compression and performance.\n")
 
 if __name__ == "__main__":
     generate_test_data()

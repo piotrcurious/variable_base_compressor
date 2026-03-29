@@ -24,17 +24,28 @@ typedef struct {
     const int16_t* base_sizes;
 
     int16_t width; // Z-order width (0 if none)
+    int8_t mode;   // 0: raw, 1: delta
+    int16_t prev_val;
+
+    uint8_t cached_byte;
+    int8_t cached_idx; // 7 to 0, -1 means no cache
 } VDecompressor;
 
 static inline bool v_read_bit(VDecompressor* d) {
     if (d->bit_pos >= d->total_bits) return false;
-    uint8_t b = pgm_read_byte_near(&d->compressed_data[d->bit_pos >> 3]);
-    bool bit = (b >> (7 - (d->bit_pos & 7))) & 1;
+
+    int8_t bit_offset = 7 - (d->bit_pos & 7);
+    if (d->cached_idx != bit_offset + 1 && d->cached_idx != bit_offset) {
+        d->cached_byte = pgm_read_byte_near(&d->compressed_data[d->bit_pos >> 3]);
+    }
+
+    bool bit = (d->cached_byte >> bit_offset) & 1;
     d->bit_pos++;
+    d->cached_idx = bit_offset;
     return bit;
 }
 
-void v_init(VDecompressor* d, const int16_t* common_h_ptr, const uint8_t* compressed, unsigned int len, unsigned long bits, int width = 0) {
+void v_init(VDecompressor* d, const int16_t* common_h_ptr, const uint8_t* compressed, unsigned int len, unsigned long bits, int width = 0, int mode = 0) {
     d->common_h_ptr = common_h_ptr;
     d->common_denom = pgm_read_word_near(&common_h_ptr[0]);
     d->num_bases = pgm_read_word_near(&common_h_ptr[1]);
@@ -47,6 +58,9 @@ void v_init(VDecompressor* d, const int16_t* common_h_ptr, const uint8_t* compre
     d->bit_pos = 0;
     d->current_idx = 0;
     d->width = width;
+    d->mode = (int8_t)mode;
+    d->prev_val = 0;
+    d->cached_idx = -1;
 }
 
 static int16_t v_read_truncated(VDecompressor* d, int16_t b) {
@@ -95,7 +109,14 @@ found:
     d->current_idx++;
     if (idx < (int32_t)d->num_unique_vals) {
         int16_t symbol = pgm_read_word_near(&d->common_h_ptr[4 + d->num_bases + idx]);
-        *out = (int16_t)(symbol * d->common_denom);
+        int16_t current = (int16_t)(symbol * d->common_denom);
+
+        if (d->mode == 1) { // delta
+            current = (int16_t)((d->prev_val + current) % 256);
+            d->prev_val = current;
+        }
+
+        *out = current;
         return true;
     }
     return false;
@@ -134,17 +155,15 @@ bool v_get_at(VDecompressor* d, unsigned int index, int16_t* out) {
 
     unsigned int target_rank = index;
     if (d->width > 0) {
-        // Find the rank of the current index (x,y) among valid z-ordered entries
         uint32_t x_target = index % d->width;
         uint32_t y_target = index / d->width;
         uint32_t z_target = z_order_encode(x_target, y_target);
 
         target_rank = 0;
-        // This scan is O(Z_target), which is O(N) in worst case but still useful
         for (uint32_t z = 0; z < z_target; z++) {
             uint32_t cur_x, cur_y;
             z_order_decode(z, &cur_x, &cur_y);
-            if (cur_x < (uint32_t)d->width && cur_y * (uint32_t)d->width + cur_x < d->original_len) {
+            if (cur_x < (uint32_t)d->width && (cur_y * (uint32_t)d->width + cur_x) < d->original_len) {
                 target_rank++;
             }
         }
@@ -153,6 +172,8 @@ bool v_get_at(VDecompressor* d, unsigned int index, int16_t* out) {
     if (target_rank < d->current_idx) {
         d->bit_pos = 0;
         d->current_idx = 0;
+        d->prev_val = 0;
+        d->cached_idx = -1;
     }
 
     int16_t temp;
