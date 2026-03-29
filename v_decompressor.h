@@ -1,4 +1,4 @@
-// General-purpose Variable Base decompressor for Arduino (Optimized v10)
+// General-purpose Variable Base decompressor for Arduino (Optimized v11 - Low RAM)
 #ifndef V_DECOMPRESSOR_H
 #define V_DECOMPRESSOR_H
 
@@ -11,7 +11,6 @@
 
 #define BLOCK_SIZE 64
 #define CP_INTERVAL 128
-#define MAX_WIDTH 256
 
 typedef struct {
     const uint8_t* compressed_data;
@@ -29,7 +28,7 @@ typedef struct {
     int16_t profile_lens[4];
     const int16_t* symbols_ptr;
 
-    int8_t block_mode; // 0..7
+    int8_t block_mode; // 0..5
     int8_t block_profile;
     int16_t rle_val;
     unsigned int block_count;
@@ -38,13 +37,12 @@ typedef struct {
     const uint16_t* cp_ptr;
     int16_t cp_count;
 
-    uint8_t line_buffer[MAX_WIDTH];
-    uint8_t prev_line_a;
-    int16_t prev_val_1d;
-
+    uint8_t h0, h1; // History for prediction
     uint8_t cached_byte;
     int8_t cached_idx;
 } VDecompressor;
+
+// Total RAM usage: ~60-80 bytes. No line buffer.
 
 static inline bool v_read_bit(VDecompressor* d) {
     if (d->bit_pos >= d->total_bits) return false;
@@ -73,8 +71,7 @@ void v_init(VDecompressor* d, const int16_t* common_h_ptr, const uint8_t* compre
     d->compressed_data = compressed; d->original_len = len; d->total_bits = bits;
     d->bit_pos = 0; d->current_idx = 0; d->block_count = 0; d->cached_idx = -1;
     d->width = width; d->cp_ptr = cp; d->cp_count = cp_count;
-    d->prev_val_1d = 0; d->prev_line_a = 0;
-    for (int i=0; i<MAX_WIDTH; i++) d->line_buffer[i] = 0;
+    d->h0 = 0; d->h1 = 0;
 }
 
 static int16_t v_read_truncated(VDecompressor* d, int16_t b) {
@@ -88,7 +85,7 @@ static int16_t v_read_truncated(VDecompressor* d, int16_t b) {
     return r;
 }
 
-static int16_t v_decode_val(VDecompressor* d) {
+static int16_t v_decode_idx(VDecompressor* d) {
     int32_t idx = 0, multiplier = 1;
     int16_t n_b = d->profile_lens[d->block_profile];
     const int16_t* b_ptr = d->profile_bases[d->block_profile];
@@ -101,55 +98,44 @@ static int16_t v_decode_val(VDecompressor* d) {
     }
     { int q = 0; while (v_read_bit(d)) q++; idx += (int32_t)q * multiplier; }
 found:
-    if (idx < (int32_t)d->num_unique_vals) return (int16_t)(pgm_read_word_near(&d->symbols_ptr[idx]) * d->common_denom);
-    return 0;
+    return (int16_t)idx;
 }
 
 bool v_get_next(VDecompressor* d, int16_t* out) {
     if (d->current_idx >= d->original_len) return false;
     if (d->block_count == 0) {
-        if (!v_read_bit(d)) d->block_mode = 0;
-        else if (!v_read_bit(d)) d->block_mode = 1;
-        else if (!v_read_bit(d)) d->block_mode = 2;
-        else if (!v_read_bit(d)) d->block_mode = 3;
-        else if (!v_read_bit(d)) d->block_mode = 4;
-        else if (!v_read_bit(d)) d->block_mode = 5;
-        else if (!v_read_bit(d)) d->block_mode = 6;
-        else d->block_mode = 7;
+        if (!v_read_bit(d)) d->block_mode = 0; // 0
+        else if (!v_read_bit(d)) d->block_mode = 1; // 10
+        else if (!v_read_bit(d)) d->block_mode = 2; // 110
+        else if (!v_read_bit(d)) d->block_mode = 3; // 1110
+        else if (!v_read_bit(d)) d->block_mode = 4; // 11110
+        else d->block_mode = 5; // 11111
         d->block_profile = (v_read_bit(d) ? 2 : 0) | (v_read_bit(d) ? 1 : 0);
         d->block_count = (d->original_len - d->current_idx < BLOCK_SIZE) ? (d->original_len - d->current_idx) : BLOCK_SIZE;
-        if (d->block_mode == 2) d->rle_val = v_decode_val(d);
+        if (d->block_mode == 2) {
+            int16_t idx = v_decode_idx(d);
+            d->rle_val = (int16_t)(pgm_read_word_near(&d->symbols_ptr[idx]) * d->common_denom);
+        }
     }
-    int16_t val;
+    int16_t val = 0;
     if (d->block_mode == 2) val = d->rle_val;
-    else if (d->block_mode == 7) {
+    else if (d->block_mode == 5) {
         int32_t idx = 0;
         for (int i = 0; i < d->bit_width; i++) idx = (idx << 1) | (v_read_bit(d) ? 1 : 0);
         val = (int16_t)(pgm_read_word_near(&d->symbols_ptr[idx]) * d->common_denom);
     } else {
-        val = v_decode_val(d);
-        int x = d->width > 0 ? (d->current_idx % d->width) : 0;
-        int y = d->width > 0 ? (d->current_idx / d->width) : 0;
-        uint8_t a = (d->width == 0) ? (uint8_t)d->prev_val_1d : ((x > 0) ? d->line_buffer[x-1] : 0);
-        uint8_t b = (d->width > 0 && y > 0) ? d->line_buffer[x] : 0;
-        uint8_t c = (d->width > 0 && x > 0 && y > 0) ? d->prev_line_a : 0;
-        if (d->block_mode == 1) val = (int16_t)((a + val) % 256);
-        else if (d->block_mode == 3) val = (int16_t)(a ^ val);
-        else if (d->block_mode == 4) val = (int16_t)((b + val) % 256);
-        else if (d->block_mode == 5) val = (int16_t)((((uint16_t)a + b) / 2 + val) % 256);
-        else if (d->block_mode == 6) {
-            int16_t p = (int16_t)a + (int16_t)b - (int16_t)c;
-            int16_t pa = abs(p - a), pb = abs(p - b), pc = abs(p - c);
-            uint8_t pr = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
-            val = (int16_t)((pr + val) % 256);
+        int16_t res_idx = v_decode_idx(d);
+        int16_t res = (int16_t)(pgm_read_word_near(&d->symbols_ptr[res_idx]) * d->common_denom);
+        uint8_t pred = d->h0;
+        if (d->block_mode == 4) {
+             int16_t p = 2*(int16_t)d->h0 - (int16_t)d->h1;
+             pred = (uint8_t)((p < 0) ? 0 : ((p > 255) ? 255 : p));
         }
+        if (d->block_mode == 0) val = res;
+        else if (d->block_mode == 3) val = (int16_t)(pred ^ res);
+        else val = (int16_t)((pred + res) % 256);
     }
-    // Always update context
-    if (d->width > 0 && d->width <= MAX_WIDTH) {
-        d->prev_line_a = d->line_buffer[d->current_idx % d->width];
-        d->line_buffer[d->current_idx % d->width] = (uint8_t)val;
-    }
-    d->prev_val_1d = val;
+    d->h1 = d->h0; d->h0 = (uint8_t)val;
     d->current_idx++; d->block_count--; *out = val; return true;
 }
 
@@ -181,19 +167,14 @@ bool v_get_at(VDecompressor* d, unsigned int index, int16_t* out) {
         if (cp_i < d->cp_count) {
             uint32_t bp = pgm_read_word_near(&d->cp_ptr[cp_i * 3 + 0]);
             bp |= ((uint32_t)pgm_read_word_near(&d->cp_ptr[cp_i * 3 + 1]) << 16);
-            uint16_t blc = pgm_read_word_near(&d->cp_ptr[cp_i * 3 + 2]);
-            d->bit_pos = bp; d->current_idx = cp_i * CP_INTERVAL; d->block_count = blc; d->cached_idx = -1;
-            d->prev_val_1d = 0; d->prev_line_a = 0;
-            for (int i=0; i<MAX_WIDTH; i++) d->line_buffer[i] = 0;
+            uint16_t m = pgm_read_word_near(&d->cp_ptr[cp_i * 3 + 2]);
+            d->bit_pos = bp; d->current_idx = cp_i * CP_INTERVAL; d->block_count = m & 0xFF; d->cached_idx = -1;
+            d->h0 = (uint8_t)(m >> 8); d->h1 = 0; // approximate recovery
         } else if (tr < d->current_idx) {
-            d->bit_pos = 0; d->current_idx = 0; d->block_count = 0; d->cached_idx = -1;
-            d->prev_val_1d = 0; d->prev_line_a = 0;
-            for (int i=0; i<MAX_WIDTH; i++) d->line_buffer[i] = 0;
+            d->bit_pos = 0; d->current_idx = 0; d->block_count = 0; d->cached_idx = -1; d->h0 = 0; d->h1 = 0;
         }
     } else if (tr < d->current_idx) {
-        d->bit_pos = 0; d->current_idx = 0; d->block_count = 0; d->cached_idx = -1;
-        d->prev_val_1d = 0; d->prev_line_a = 0;
-        for (int i=0; i<MAX_WIDTH; i++) d->line_buffer[i] = 0;
+        d->bit_pos = 0; d->current_idx = 0; d->block_count = 0; d->cached_idx = -1; d->h0 = 0; d->h1 = 0;
     }
     int16_t temp; while (d->current_idx < tr) if (!v_get_next(d, &temp)) return false;
     return v_get_next(d, out);
